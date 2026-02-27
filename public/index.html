@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <title>ShrimpNet</title>
+
+  <!-- PWA / home screen -->
+  <link rel="manifest" href="/manifest.json" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="ShrimpNet" />
+  <meta name="theme-color" content="#5b7fff" />
+  <link rel="apple-touch-icon" href="/icon-192.png" />
+
+  <link rel="stylesheet" href="/style.css?v=1772219093" />
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+</head>
+<body>
+  <div id="app">
+    <!-- Sidebar -->
+    <aside id="sidebar">
+      <div id="sidebar-header">
+        <div id="logo">🦐 ShrimpNet</div>
+        <button id="notif-btn" title="Toggle notifications" aria-label="Toggle notifications">🔔</button>
+        <button id="sidebar-toggle" title="Toggle sidebar" aria-label="Toggle sidebar">☰</button>
+      </div>
+      <button id="new-chat-btn">+ New Chat</button>
+
+      <!-- Filter Bar -->
+      <div id="filter-bar">
+        <div id="filter-groups"></div>
+        <div id="filter-agents"></div>
+        <div id="filter-count" class="hidden"></div>
+      </div>
+
+      <div id="conversation-list"></div>
+    </aside>
+
+    <!-- Mobile overlay -->
+    <div id="overlay"></div>
+
+    <!-- Main area -->
+    <main id="main">
+      <!-- Empty state -->
+      <div id="empty-state">
+        <button class="mobile-menu-float" onclick="openSidebar()" aria-label="Open menu">☰</button>
+        <div id="empty-icon">🦐</div>
+        <h2>ShrimpNet</h2>
+        <p>Select a conversation or start a new chat.</p>
+        <button id="empty-new-chat-btn">+ New Chat</button>
+      </div>
+
+      <!-- New Chat view -->
+      <div id="new-chat-view" class="hidden">
+        <div id="new-chat-header">
+          <button class="mobile-menu-float" onclick="openSidebar()" aria-label="Open menu">☰</button>
+          <h2>New Conversation</h2>
+        </div>
+        <div id="agent-selector">
+          <p class="selector-hint">Select one or more agents to chat with:</p>
+          <div id="agent-grid"></div>
+          <div id="selected-pills"></div>
+        </div>
+        <div id="new-chat-compose">
+          <textarea id="new-chat-input" placeholder="Type your first message…" rows="2"></textarea>
+          <button id="new-chat-send-btn">Send</button>
+        </div>
+      </div>
+
+      <!-- Chat view -->
+      <div id="chat-view" class="hidden">
+        <div id="chat-header" style="position:relative">
+          <div id="chat-participants"></div>
+          <button id="add-agent-btn" title="Add agent">+ Agent</button>
+          <div id="add-agent-dropdown" class="hidden"></div>
+        </div>
+        <div id="messages-container">
+          <div id="messages"></div>
+        </div>
+        <div id="compose-area">
+          <textarea id="message-input" placeholder="Message... (@ to mention agents)" rows="1"></textarea>
+          <button id="send-btn" aria-label="Send message">Send</button>
+        </div>
+      </div>
+    </main>
+  </div>
+  <script src="/app.js?v=1772219093"></script>
+</body>
+</html>
