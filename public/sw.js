@@ -1,7 +1,7 @@
-/* ShrimpNet Service Worker — Push Notifications */
+/* PulseNet Service Worker — Push Notifications */
 'use strict';
 
-const CACHE_NAME = 'shrimpnet-v1';
+const CACHE_NAME = 'pulsenet-v1';
 
 // ── Install: cache shell assets ───────────────────────────────────────────────
 self.addEventListener('install', event => {
@@ -21,7 +21,7 @@ self.addEventListener('push', event => {
     data = { body: event.data ? event.data.text() : 'New message' };
   }
 
-  const title   = data.title  || '🦐 ShrimpNet';
+  const title   = data.title  || '🦐 PulseNet';
   const body    = data.body   || 'New message';
   const convId  = data.conversationId || 'general';
   const url     = data.url    || '/';

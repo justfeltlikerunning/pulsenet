@@ -1,6 +1,6 @@
 {
-  "name": "ShrimpNet",
-  "short_name": "ShrimpNet",
+  "name": "PulseNet",
+  "short_name": "PulseNet",
   "description": "AI Agent Fleet Chat",
   "start_url": "/",
   "display": "standalone",

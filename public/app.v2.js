@@ -112,12 +112,32 @@ function escHtml(str) {
 
 function renderMarkdown(text) {
   if (!text) return '';
+  // Check if text has markdown formatting worth parsing
+  const hasMarkdown = /[*_`#\[\]|>~\-]{2,}|^#{1,6} |\*\*|__/.test(text);
+  if (!hasMarkdown) {
+    // Plain text (most human messages): preserve all whitespace exactly
+    return '<p>' + escHtml(text).replace(/\n/g, '<br>') + '</p>';
+  }
   try {
     if (typeof marked !== 'undefined') {
-      return marked.parse(text, { breaks: true, gfm: true });
+      // For markdown: convert consecutive newlines to <br> before parsing
+      // so marked doesn't collapse them
+      let processed = text.replace(/\n\n+/g, function(match) {
+        // Replace each extra newline beyond the first with a zero-width space + newline
+        // This tricks marked into preserving them as separate line breaks
+        let result = '\n';
+        for (let i = 1; i < match.length; i++) {
+          result += '\u200B\n';
+        }
+        return result;
+      });
+      let html = marked.parse(processed, { breaks: true, gfm: true });
+      // Wrap tables in scrollable container for mobile
+      html = html.replace(/<table>/g, '<div class="table-scroll"><table>').replace(/<\/table>/g, '</table></div>');
+      return html;
     }
   } catch(e) {}
-  return `<p>${escHtml(text).replace(/\n/g,'<br>')}</p>`;
+  return '<p>' + escHtml(text).replace(/\n/g, '<br>') + '</p>';
 }
 
 function showView(viewName) {
@@ -260,14 +280,18 @@ function buildGroupedView(filtered) {
   const pinned = filtered.filter(c => c.pinned === 1 || c.pinned === true);
   const unpinned = filtered.filter(c => !(c.pinned === 1 || c.pinned === true));
 
-  // Categorize by category field (server-side)
+  // Categorize by conv_type
   const chats = [];     // human conversations (direct agent chats)
   const reports = [];   // report/notification channels
+  const mesh = [];      // agent-to-agent / mesh broadcasts
 
   for (const conv of unpinned) {
-    const cat = conv.category || conv.conv_type || 'chat';
-    if (cat === 'report' || conv.conv_type === 'report') {
+    const id = conv.id || '';
+    const type = conv.conv_type || 'human';
+    if (type === 'report' || id.startsWith('reports-')) {
       reports.push(conv);
+    } else if (type === 'agent' || id.startsWith('mesh-')) {
+      mesh.push(conv);
     } else {
       chats.push(conv);
     }
@@ -281,10 +305,12 @@ function buildGroupedView(filtered) {
   };
   chats.sort(byRecent);
   reports.sort(byRecent);
+  mesh.sort(byRecent);
 
   // Build categorized sections
   const sections = [];
   if (chats.length) sections.push({ label: '💬 Chats', convs: chats });
+  if (mesh.length) sections.push({ label: '📡 Fleet Comms', convs: mesh });
   if (reports.length) sections.push({ label: '📋 Reports & Alerts', convs: reports });
 
   // Legacy grouping within each section (maintain agent grouping)
@@ -345,6 +371,33 @@ function renderConvItem(conv, indented = false) {
     e.preventDefault();
     showConvContextMenu(e, conv);
   });
+
+  // iOS Safari: long-press via touch events (contextmenu doesn't fire on iOS)
+  let convTouchTimer = null;
+  let convTouchMoved = false;
+  div.addEventListener('touchstart', (e) => {
+    convTouchMoved = false;
+    convTouchTimer = setTimeout(() => {
+      if (!convTouchMoved) {
+        e.preventDefault();
+        // Haptic feedback if available
+        if (navigator.vibrate) navigator.vibrate(10);
+        const touch = e.touches[0] || e.changedTouches[0];
+        showConvContextMenu({ clientX: touch.clientX, clientY: touch.clientY, preventDefault: () => {} }, conv);
+      }
+    }, 500);
+  }, { passive: false });
+  div.addEventListener('touchmove', () => {
+    convTouchMoved = true;
+    if (convTouchTimer) { clearTimeout(convTouchTimer); convTouchTimer = null; }
+  }, { passive: true });
+  div.addEventListener('touchend', () => {
+    if (convTouchTimer) { clearTimeout(convTouchTimer); convTouchTimer = null; }
+  }, { passive: true });
+  div.addEventListener('touchcancel', () => {
+    if (convTouchTimer) { clearTimeout(convTouchTimer); convTouchTimer = null; }
+  }, { passive: true });
+
   return div;
 }
 
@@ -620,11 +673,17 @@ async function openConversation(convId) {
 
 function renderChatHeader(conv) {
   const titleEl = document.getElementById('chat-conv-title');
-  if (!conv) { dom.chatParticipants.innerHTML = ''; if (titleEl) titleEl.textContent = ''; return; }
+  const countEl = document.getElementById('chat-participant-count');
+  if (!conv) { dom.chatParticipants.innerHTML = ''; if (titleEl) titleEl.textContent = ''; if (countEl) countEl.textContent = ''; return; }
   // Set conversation title in header
   if (titleEl) {
     const displayTitle = conv.title || conv.id || 'Conversation';
     titleEl.textContent = displayTitle;
+  }
+  // Show participant count in collapsed state
+  const partsList = conv.participants || [];
+  if (countEl) {
+    countEl.textContent = partsList.length > 0 ? '(' + partsList.length + ' agents)' : '';
   }
   const parts = conv.participants || [];
   dom.chatParticipants.innerHTML = parts.map(p => {
@@ -897,7 +956,7 @@ async function loadAllAgentHistory() {
 // Send new chat
 dom.newChatSendBtn.addEventListener('click', sendNewChat);
 dom.newChatInput.addEventListener('keydown', e => {
-  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendNewChat(); }
+  if (e.key === 'Enter' && (e.shiftKey || e.ctrlKey || e.metaKey)) { e.preventDefault(); sendNewChat(); }
 });
 
 async function sendNewChat() {
@@ -938,14 +997,21 @@ async function sendNewChat() {
 // ─── Send message in existing chat ───────────────────────────────────────────
 dom.sendBtn.addEventListener('click', sendMessage);
 dom.messageInput.addEventListener('keydown', e => {
-  if (e.key === 'Enter' && !e.shiftKey) {
-    e.preventDefault();
-    // Close autocomplete if open, otherwise send
+  if (e.key === 'Enter') {
+    // Mention dropdown open → select the item
     if (mention.dropdown && !mention.dropdown.classList.contains('hidden')) {
+      e.preventDefault();
       mention.select();
-    } else {
+      return;
+    }
+    // On mobile/touch devices: Enter ALWAYS inserts newline, never sends
+    // On desktop: Ctrl+Enter or Meta+Enter sends
+    const isMobile = ('ontouchstart' in window) || (navigator.maxTouchPoints > 0);
+    if (!isMobile && (e.ctrlKey || e.metaKey)) {
+      e.preventDefault();
       sendMessage();
     }
+    // else: let Enter insert a newline naturally (both mobile and desktop)
   }
   if (e.key === 'Tab' && mention.dropdown && !mention.dropdown.classList.contains('hidden')) {
     e.preventDefault();
@@ -969,6 +1035,35 @@ dom.messageInput.addEventListener('input', () => {
   dom.messageInput.style.height = 'auto';
   dom.messageInput.style.height = Math.min(dom.messageInput.scrollHeight, 160) + 'px';
   mention.onInput();
+});
+
+// iOS Safari: keyup also triggers mention check (input event can miss @ from suggestion bar)
+dom.messageInput.addEventListener('keyup', () => { mention.onInput(); });
+
+// iOS Safari: Also check after a short delay to catch autocomplete insertions
+dom.messageInput.addEventListener('compositionend', () => {
+  setTimeout(() => mention.onInput(), 50);
+});
+
+// iOS Safari: 'beforeinput' fires before value updates - schedule check after
+dom.messageInput.addEventListener('beforeinput', (e) => {
+  if (e.data && e.data.includes('@')) {
+    setTimeout(() => mention.onInput(), 0);
+    setTimeout(() => mention.onInput(), 100);
+  }
+});
+
+// iOS Safari: 'textInput' event (non-standard but Safari supports it)
+dom.messageInput.addEventListener('textInput', (e) => {
+  if (e.data && e.data.includes('@')) {
+    setTimeout(() => mention.onInput(), 0);
+    setTimeout(() => mention.onInput(), 100);
+  }
+});
+
+// iOS Safari: touch on textarea can change cursor - recheck mentions
+dom.messageInput.addEventListener('touchend', () => {
+  setTimeout(() => mention.onInput(), 100);
 });
 
 // ─── File Upload Wiring ──────────────────────────────────────────────────────
@@ -1203,7 +1298,7 @@ dom.newChatInput.addEventListener('input', () => {
   mention.onInput();
 });
 dom.newChatInput.addEventListener('keydown', e => {
-  if (e.key === 'Enter' && !e.shiftKey && !(mention.dropdown && !mention.dropdown.classList.contains('hidden'))) {
+  if (e.key === 'Enter' && (e.shiftKey || e.ctrlKey || e.metaKey) && !(mention.dropdown && !mention.dropdown.classList.contains('hidden'))) {
     e.preventDefault();
     sendNewChat();
   }
@@ -1236,6 +1331,24 @@ async function sendMessage() {
   dom.messageInput.style.height = 'auto';
   dom.sendBtn.disabled = true;
 
+  // Handle /stop immediately — don't show as a chat bubble
+  if (body.trim() === '/stop') {
+    try {
+      const resp = await fetch('/api/messages', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ conversationId: currentConvId, sender: 'Richard', senderType: 'human', body: '/stop' }),
+      });
+      const result = await resp.json();
+      // Clear typing indicators from UI
+      const typingEl = document.getElementById('typing-indicator');
+      if (typingEl) typingEl.remove();
+    } catch(e) { console.error('/stop failed:', e); }
+    dom.sendBtn.disabled = false;
+    dom.messageInput.focus();
+    return;
+  }
+
   // Smart routing: @mentions target specific agents, no @mention targets all participants
   const mentionRegex = /@(\w+)/g;
   let match;
@@ -1245,6 +1358,11 @@ async function sendMessage() {
 
   while ((match = mentionRegex.exec(body)) !== null) {
     const mentioned = match[1].toLowerCase();
+    // Handle @all as a special target
+    if (mentioned === 'all') {
+      mentionedAgents.push('all');
+      continue;
+    }
     const agent = agentByName(mentioned);
     if (agent) {
       mentionedAgents.push(agent.id);
@@ -1269,12 +1387,42 @@ async function sendMessage() {
 
   // If @mentions present → route ONLY to mentioned agents
   // If no @mentions → route to all participants
+  // Special: @all targets everyone in the conversation
   const allParticipants = conv?.participants || [];
-  // Smart routing: only send explicit @mentions as targets
-  // Empty targets = server routes to last responding agent (not broadcast all)
-  const targets = mentionedAgents.length > 0
-    ? [...new Set(mentionedAgents)]  // dedupe
-    : [];  // Let server handle smart routing
+  const hasAll = /@all\b/i.test(body);
+  let targets;
+  if (hasAll) {
+    // @all — get all participants, but if there's also a named @agent before @all,
+    // that agent becomes coordinator (sent first in targets array)
+    const namedAgents = mentionedAgents.filter(a => a !== 'all');
+    if (namedAgents.length > 0) {
+      // Coordinator pattern: @LtDan @all → LtDan coordinates, rest support
+      const rest = allParticipants.filter(p => !namedAgents.includes(p.toLowerCase()));
+      targets = [...namedAgents, ...rest];
+    } else {
+      // Plain @all → broadcast to all, first participant is default coordinator
+      targets = [...allParticipants];
+    }
+    targets = [...new Set(targets)]; // dedupe
+  } else if (mentionedAgents.length > 0) {
+    targets = [...new Set(mentionedAgents)];
+  } else {
+    // No @mention — route to the last agent who spoke (reply inference)
+    // This prevents "Yes" from going to all 9 agents when you meant to reply to one
+    const lastAgentMsg = currentMessages.slice().reverse().find(m => m.sender_type === 'agent');
+    if (lastAgentMsg && allParticipants.includes(lastAgentMsg.sender)) {
+      targets = [lastAgentMsg.sender];
+      console.log('[Send] No @mention — inferred target:', lastAgentMsg.sender, '(last agent who spoke)');
+    } else if (allParticipants.length === 1) {
+      targets = allParticipants;
+    } else if (allParticipants.length > 1) {
+      // Multiple participants but can't infer — send to all with a note
+      targets = allParticipants;
+      console.log('[Send] No @mention, multiple participants — broadcasting to all');
+    } else {
+      targets = [];
+    }
+  }
 
   // ─── OPTIMISTIC: Show message immediately (iMessage behavior) ────────────
   const optimisticId = 'opt_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
@@ -1308,12 +1456,22 @@ async function sendMessage() {
 
   // ─── Handle file uploads ───────────────────────────────────────────────
   if (pendingFiles.length) {
+    // Prevent double-tap / rapid-fire upload
+    if (window._uploadInProgress) {
+      console.log('[Send] Upload already in progress — skipping');
+      dom.sendBtn.disabled = false;
+      return;
+    }
+    window._uploadInProgress = true;
+    let isFirstFile = true;
     for (const file of pendingFiles) {
       const formData = new FormData();
       formData.append('file', file);
       formData.append('conversationId', currentConvId);
       formData.append('sender', 'Richard');
-      if (body) formData.append('message', body);
+      if (body && isFirstFile) formData.append('message', body);
+      if (targets.length > 0 && isFirstFile) formData.append('targets', JSON.stringify(targets));
+      isFirstFile = false;
       try {
         const uresp = await fetch('/api/upload', { method: 'POST', body: formData });
         if (!uresp.ok) console.error('Upload failed:', uresp.status);
@@ -1322,6 +1480,7 @@ async function sendMessage() {
       }
     }
     pendingFiles = [];
+    window._uploadInProgress = false;
     renderFilePreview();
     // Remove optimistic message for file sends (server will broadcast the real one)
     if (optWrapper) optWrapper.remove();
@@ -1394,11 +1553,16 @@ const mention = {
   },
 
   onInput() {
-    const input = this.getActiveInput();
+    const input = this.getActiveInput() || dom.messageInput;
     if (!input) { this.hide(); return; }
 
     const val = input.value;
-    const pos = input.selectionStart || 0;
+    if (!val) { this.hide(); return; }
+    // iOS Safari: selectionStart can be null during composition or prediction
+    let pos = input.selectionStart;
+    if (pos === null || pos === undefined || pos < 0) pos = val.length;
+    // iOS can report selectionStart beyond actual value length
+    if (pos > val.length) pos = val.length;
 
     // Find last @ before cursor
     let atIdx = -1;
@@ -1414,10 +1578,27 @@ const mention = {
     this.query = query;
     this.currentInput = input;
 
-    this.filtered = AGENTS.filter(a =>
-      a.name.toLowerCase().startsWith(query) ||
-      a.id.toLowerCase().startsWith(query)
-    );
+    // Get current conversation participants for @all
+    const conv = conversations.find(c => c.id === currentConvId);
+    const participants = (conv?.participants || []);
+    
+    // Special entries: @all (all participants)
+    const specialEntries = [];
+    if ('all'.startsWith(query) && participants.length > 1) {
+      specialEntries.push({
+        id: 'all', name: 'all', color: '#ff9800',
+        role: 'All ' + participants.length + ' agents in chat',
+        isSpecial: true, icon: '📢'
+      });
+    }
+    
+    this.filtered = [
+      ...specialEntries,
+      ...AGENTS.filter(a =>
+        a.name.toLowerCase().startsWith(query) ||
+        a.id.toLowerCase().startsWith(query)
+      )
+    ];
 
     if (this.filtered.length === 0) { this.hide(); return; }
 
@@ -1434,14 +1615,16 @@ const mention = {
       const presStatus = agentPresence[agent.id] || 'unknown';
       const item = document.createElement('div');
       item.className = `mention-item${i === this.selectedIdx ? ' selected' : ''}`;
-      item.innerHTML = `
-        <div class="mention-avatar" style="background:${agent.color}">${agent.name[0]}</div>
-        <div class="mention-info">
-          <span class="mention-name">${escHtml(agent.name)}</span>
-          <span class="mention-role">${escHtml(agent.role)}</span>
-        </div>
-        <div class="presence-dot ${presStatus}" style="margin-left:auto;flex-shrink:0"></div>
-      `;
+      const avatarContent = agent.isSpecial ? agent.icon : agent.name[0];
+      const avatarStyle = agent.isSpecial
+        ? 'background:' + agent.color + ';font-size:14px;display:flex;align-items:center;justify-content:center'
+        : 'background:' + agent.color;
+      item.innerHTML = '<div class="mention-avatar" style="' + avatarStyle + '">' + avatarContent + '</div>' +
+        '<div class="mention-info">' +
+        '<span class="mention-name"' + (agent.isSpecial ? ' style="font-weight:700"' : '') + '>' + (agent.isSpecial ? '@' : '') + escHtml(agent.name) + '</span>' +
+        '<span class="mention-role">' + escHtml(agent.role) + '</span>' +
+        '</div>' +
+        (agent.isSpecial ? '' : '<div class="presence-dot ' + presStatus + '" style="margin-left:auto;flex-shrink:0"></div>');
       item.addEventListener('mousedown', (e) => {
         e.preventDefault(); // Don't blur input
         this.selectedIdx = i;
@@ -1449,9 +1632,18 @@ const mention = {
       });
       item.addEventListener('touchend', (e) => {
         e.preventDefault();
+        e.stopPropagation();
         this.selectedIdx = i;
         this.select();
       });
+      // iOS: touchstart for immediate visual feedback
+      item.addEventListener('touchstart', (e) => {
+        this.selectedIdx = i;
+        const items = this.dropdown.querySelectorAll('.mention-item');
+        items.forEach((el, j) => el.classList.toggle('selected', j === i));
+      }, { passive: true });
+      item.style.webkitTapHighlightColor = 'transparent';
+      item.style.touchAction = 'manipulation';
       this.dropdown.appendChild(item);
     }
 
@@ -1463,17 +1655,29 @@ const mention = {
     const rect = input.getBoundingClientRect();
     const ddHeight = Math.min(this.filtered.length * 48, 240);
 
-    // On mobile, always show above input and take full width
-    const isMobile = window.innerWidth <= 768;
+    // Detect mobile via touch support + screen width
+    const isMobile = window.innerWidth <= 768 || ('ontouchstart' in window);
+    // Use visualViewport for accurate height with virtual keyboard (iOS Safari)
+    const vv = window.visualViewport;
+    const vvHeight = vv ? vv.height : window.innerHeight;
+    const vvTop = vv ? vv.offsetTop : 0;
 
     let top, left, width;
 
     if (isMobile) {
       // Mobile: full-width above the input bar
+      // Use visualViewport to account for virtual keyboard
       top = rect.top - ddHeight - 6;
       left = 4;
       width = window.innerWidth - 8;
-      if (top < 4) top = 4; // don't go off screen top
+      // If dropdown would be above visible viewport, show BELOW input instead
+      if (top < vvTop + 4) {
+        top = rect.bottom + 6;
+        // If still offscreen, just pin to top of visible area
+        if (top + ddHeight > vvTop + vvHeight) {
+          top = vvTop + 4;
+        }
+      }
     } else {
       // Desktop: positioned near cursor
       const spaceAbove = rect.top;
@@ -1667,12 +1871,14 @@ function connectSSE() {
   sse = new EventSource('/events');
 
   sse.addEventListener('message', e => {
+    markSseActivity();
     let msg;
     try { msg = JSON.parse(e.data); } catch(_) { return; }
     handleIncomingMessage(msg);
   });
 
   sse.addEventListener('agent_presence', e => {
+    markSseActivity();
     try {
       const data = JSON.parse(e.data);
       if (data.agent && data.status) {
@@ -1719,6 +1925,7 @@ function connectSSE() {
   });
 
   sse.addEventListener('typing_start', e => {
+    markSseActivity();
     try {
       const data = JSON.parse(e.data);
       const { agentName, conversationId } = data;
@@ -1769,9 +1976,87 @@ function connectSSE() {
 
   sse.onerror = () => {
     sse.close();
-    setTimeout(connectSSE, 3000);
+    console.log('[SSE] Connection lost, reconnecting in 3s...');
+    setTimeout(() => {
+      connectSSE();
+      catchUpMessages();
+    }, 3000);
   };
 }
+
+// ─── SSE Health & Reconnect ─────────────────────────────────────────────────
+let lastSseActivity = Date.now();
+
+// Track SSE activity on every event
+function markSseActivity() { lastSseActivity = Date.now(); }
+
+// Catch up missed messages for current conversation
+async function catchUpMessages() {
+  if (!currentConvId || !currentMessages.length) return;
+  const lastMsg = currentMessages[currentMessages.length - 1];
+  if (!lastMsg || !lastMsg.timestamp) return;
+  try {
+    const since = encodeURIComponent(lastMsg.timestamp);
+    const resp = await fetch('/api/messages/' + encodeURIComponent(currentConvId) + '?since=' + since);
+    const newMsgs = await resp.json();
+    if (!newMsgs.length) return;
+    console.log('[SSE] Catching up ' + newMsgs.length + ' missed messages');
+    for (const msg of newMsgs) {
+      if (!currentMessages.find(m => m.id === msg.id)) {
+        const prev = currentMessages[currentMessages.length - 1];
+        const isConsecutive = prev &&
+          prev.sender === msg.sender &&
+          (new Date(msg.timestamp) - new Date(prev.timestamp)) < 2 * 60 * 1000;
+        currentMessages.push(msg);
+        appendMessage(msg, isConsecutive);
+      }
+    }
+    if (newMsgs.length) scrollToBottom();
+  } catch(e) {
+    console.error('[SSE] Catch-up failed:', e);
+  }
+  // Also refresh conversation list to update sidebar
+  try {
+    const resp = await fetch('/api/conversations');
+    const convs = await resp.json();
+    conversations = convs;
+    renderConversationList();
+  } catch(_) {}
+}
+
+// When page becomes visible again, check SSE and catch up
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) return;
+  console.log('[SSE] Page visible — checking connection');
+  const staleMs = Date.now() - lastSseActivity;
+  // If no SSE activity in 30s (server pings every 25s), reconnect
+  if (!sse || sse.readyState === EventSource.CLOSED || staleMs > 30000) {
+    console.log('[SSE] Connection stale (' + Math.round(staleMs/1000) + 's), reconnecting');
+    connectSSE();
+    setTimeout(catchUpMessages, 500); // slight delay for SSE to establish
+  } else {
+    // Connection looks alive, but still catch up in case we missed messages while backgrounded
+    catchUpMessages();
+  }
+});
+
+// Periodic SSE health check — every 30s, verify connection is alive
+setInterval(() => {
+  if (document.hidden) return; // don't bother if page is hidden
+  if (!sse || sse.readyState === EventSource.CLOSED) {
+    console.log('[SSE] Health check: connection dead, reconnecting');
+    connectSSE();
+    setTimeout(catchUpMessages, 500);
+  } else {
+    const staleMs = Date.now() - lastSseActivity;
+    if (staleMs > 35000) { // server pings every 25s, allow 10s grace
+      console.log('[SSE] Health check: no activity for ' + Math.round(staleMs/1000) + 's, reconnecting');
+      sse.close();
+      connectSSE();
+      setTimeout(catchUpMessages, 500);
+    }
+  }
+}, 30000);
 
 function handleIncomingMessage(msg) {
   if (!msg || !msg.id) return;
@@ -2031,6 +2316,67 @@ async function initPush() {
   });
 })();
 
+// ─── Dismiss keyboard on scroll (mobile) ────────────────────────────────────
+(function initScrollDismiss() {
+  const messagesContainer = document.getElementById('messages-container');
+  if (!messagesContainer) return;
+
+  let scrollStartY = 0;
+  let scrollStartTime = 0;
+  let dismissed = false;
+  let lastY = 0;
+  let samples = [];
+
+  messagesContainer.addEventListener('touchstart', (e) => {
+    scrollStartY = e.touches[0].clientY;
+    lastY = scrollStartY;
+    scrollStartTime = Date.now();
+    dismissed = false;
+    samples = [];
+  }, { passive: true });
+
+  messagesContainer.addEventListener('touchmove', (e) => {
+    if (dismissed) return;
+    const y = e.touches[0].clientY;
+    const now = Date.now();
+
+    // Track recent movement samples for velocity calc
+    samples.push({ y, t: now });
+    if (samples.length > 5) samples.shift();
+
+    const totalDy = y - scrollStartY;
+    const elapsed = now - scrollStartTime;
+
+    // Only care about downward drag (finger moving down = scrolling up through history)
+    if (totalDy <= 0) { lastY = y; return; }
+
+    // Calculate recent velocity (px/ms) from last few samples
+    let velocity = 0;
+    if (samples.length >= 2) {
+      const first = samples[0];
+      const last = samples[samples.length - 1];
+      const dt = last.t - first.t;
+      if (dt > 0) velocity = (last.y - first.y) / dt;
+    }
+
+    // Dismiss when: sustained slow drag (>60px, not a flick)
+    // A flick has high velocity (>1.5 px/ms) — let it scroll naturally
+    // A deliberate drag has moderate velocity and decent distance
+    const isSlowDrag = velocity > 0.05 && velocity < 1.5;
+    const hasDistance = totalDy > 60;
+    const hasTime = elapsed > 150; // at least 150ms of dragging
+
+    if (hasDistance && isSlowDrag && hasTime) {
+      const active = document.activeElement;
+      if (active && (active === dom.messageInput || active === dom.newChatInput || active.tagName === 'TEXTAREA' || active.tagName === 'INPUT')) {
+        active.blur();
+        dismissed = true;
+      }
+    }
+    lastY = y;
+  }, { passive: true });
+})();
+
 // ─── Spacer for messages-push-to-bottom ──────────────────────────────────────
 function ensureMessageSpacer() {
   const existing = dom.messages.querySelector('.msg-spacer');
@@ -2122,6 +2468,7 @@ function renderReplyPreview() {
 if (typeof sse !== 'undefined' && sse) {
   // ── Streaming chunk handler — update message content in real-time ──────────
   sse.addEventListener('message_chunk', e => {
+    markSseActivity();
     try {
       const data = JSON.parse(e.data);
       if (data.conversationId !== currentConvId) return;
@@ -2145,6 +2492,7 @@ if (typeof sse !== 'undefined' && sse) {
 
   // ── Stream complete — final update + stop typing ──────────────────────────
   sse.addEventListener('message_complete', e => {
+    markSseActivity();
     try {
       const data = JSON.parse(e.data);
       if (data.conversationId !== currentConvId) return;
@@ -2575,3 +2923,106 @@ document.addEventListener('click', e => {
   updateSelectCount();
 }, true);
 
+
+// ── Collapsible header toggle ──────────────────────────────────────────────
+(function() {
+  var toggleBtn = document.getElementById('header-toggle-btn');
+  var row2 = document.getElementById('chat-header-row2');
+  var titleBar = document.getElementById('chat-title-bar');
+
+  function toggleHeaderRow2(e) {
+    if (e) e.preventDefault();
+    if (!row2) return;
+    var isCollapsed = row2.classList.contains('collapsed');
+    if (isCollapsed) {
+      row2.classList.remove('collapsed');
+      if (toggleBtn) toggleBtn.classList.add('expanded');
+    } else {
+      row2.classList.add('collapsed');
+      if (toggleBtn) toggleBtn.classList.remove('expanded');
+    }
+  }
+
+  if (toggleBtn) {
+    toggleBtn.addEventListener('click', function(e) { e.stopPropagation(); toggleHeaderRow2(e); });
+    toggleBtn.addEventListener('touchend', function(e) { e.stopPropagation(); e.preventDefault(); toggleHeaderRow2(e); });
+  }
+  if (titleBar) {
+    titleBar.addEventListener('click', function(e) { toggleHeaderRow2(e); });
+  }
+
+  // Collapse header when tapping anywhere else
+  document.addEventListener('click', function(e) {
+    if (!row2 || row2.classList.contains('collapsed')) return;
+    var header = document.getElementById('chat-header');
+    if (header && !header.contains(e.target)) {
+      row2.classList.add('collapsed');
+      if (toggleBtn) toggleBtn.classList.remove('expanded');
+    }
+  });
+
+  // Also collapse when scrolling messages
+  var msgsEl = document.getElementById('messages');
+  if (msgsEl) {
+    msgsEl.addEventListener('scroll', function() {
+      if (row2 && !row2.classList.contains('collapsed')) {
+        row2.classList.add('collapsed');
+        if (toggleBtn) toggleBtn.classList.remove('expanded');
+      }
+    });
+  }
+})();
+
+
+// ─── Undo Send Toast ──────────────────────────────────────────────────────────
+function showUndoToast(msgId, convId, windowMs) {
+  // Remove any existing toast
+  const existing = document.getElementById('undo-toast');
+  if (existing) existing.remove();
+  
+  const toast = document.createElement('div');
+  toast.id = 'undo-toast';
+  toast.innerHTML = `
+    <span>Message sent</span>
+    <button id="undo-send-btn">Undo</button>
+    <div class="undo-progress"><div class="undo-progress-bar"></div></div>
+  `;
+  document.body.appendChild(toast);
+  
+  // Animate progress bar
+  const bar = toast.querySelector('.undo-progress-bar');
+  bar.style.transition = `width ${windowMs}ms linear`;
+  requestAnimationFrame(() => { bar.style.width = '0%'; });
+  
+  // Auto-dismiss after window expires
+  const timer = setTimeout(() => {
+    toast.classList.add('undo-toast-hide');
+    setTimeout(() => toast.remove(), 300);
+  }, windowMs);
+  
+  // Undo button handler
+  toast.querySelector('#undo-send-btn').addEventListener('click', async () => {
+    clearTimeout(timer);
+    try {
+      const resp = await fetch('/api/messages/' + encodeURIComponent(msgId), { method: 'DELETE' });
+      const result = await resp.json();
+      if (result.ok) {
+        // Remove from UI
+        const msgEl = document.querySelector('[data-msg-id="' + msgId + '"]');
+        if (msgEl) msgEl.remove();
+        // Remove from currentMessages
+        const idx = currentMessages.findIndex(m => m.id === msgId);
+        if (idx >= 0) currentMessages.splice(idx, 1);
+      }
+    } catch(e) {
+      console.warn('Undo failed:', e);
+    }
+    toast.remove();
+  });
+  
+  // Also allow tap-to-dismiss on the toast text
+  toast.querySelector('span').addEventListener('click', () => {
+    clearTimeout(timer);
+    toast.remove();
+  });
+}
