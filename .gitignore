@@ -1,0 +1,26 @@
+node_modules/
+data/
+config/
+package-lock.json
+*.env
+.env*
+vapid-keys.json
+*.bak*
+src/*.bak*
+*.broken*
+TASK.md
+*.pre-*
+fix-*.js
+pulsenet-*.js
+PULSENET-*.md
+pulsenet-*.js
+PULSENET-*.md
+config/config.json
+config/*.local.*
+pulsenet.db
+*.db
+*.bak*
+*.bak
+
+# iOS binary
+public/ios/*.ipa
