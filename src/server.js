@@ -1,6 +1,143 @@
 'use strict';
 
 const http = require('http');
+
+// ── Persistent fleet model state ──
+const MODEL_STATE_FILE = '/home/shrimpnet/shrimpnet/data/fleet-model-state.json';
+const fs_sync = require('fs');
+function loadModelState() {
+  try { return JSON.parse(fs_sync.readFileSync(MODEL_STATE_FILE, 'utf8')); }
+  catch(_) { return { models: {}, ts: 0, source: 'default' }; }
+}
+function saveModelState(state) {
+  try {
+    fs_sync.mkdirSync('/home/shrimpnet/shrimpnet/data', { recursive: true });
+    fs_sync.writeFileSync(MODEL_STATE_FILE, JSON.stringify(state, null, 2));
+  } catch(e) { console.error('[model-state] save failed:', e.message); }
+}
+let _modelState = loadModelState();
+const ALL_AGENTS = ['ltdan','bayou','wesley','greenbow','danwatch','feather','jenny','bubbawatch','sully','shrimpstick'];
+if (Object.keys(_modelState.models || {}).length === 0) {
+  _modelState.models = Object.fromEntries(ALL_AGENTS.map(a => [a, 'sonnet']));
+  _modelState.source = 'default';
+  saveModelState(_modelState);
+}
+
+
+// ── Machine Resource Polling ───────────────────────────────────────────────
+const https_mod = require('https');
+const http_mod  = require('http');
+
+function httpGet(url, timeoutMs=4000) {
+  return new Promise((resolve) => {
+    const mod = url.startsWith('https') ? https_mod : http_mod;
+    const timer = setTimeout(() => resolve(null), timeoutMs);
+    try {
+      mod.get(url, (r) => {
+        let body = '';
+        r.on('data', d => body += d);
+        r.on('end', () => { clearTimeout(timer); try { resolve(JSON.parse(body)); } catch(_) { resolve(null); } });
+        r.on('error', () => { clearTimeout(timer); resolve(null); });
+      }).on('error', () => { clearTimeout(timer); resolve(null); });
+    } catch(_) { clearTimeout(timer); resolve(null); }
+  });
+}
+
+let _machineCache = { ts: 0, data: null };
+const MACHINE_TTL = 12000; // 12s cache
+
+async function fetchMachineData() {
+  const now = Date.now();
+  if (_machineCache.data && (now - _machineCache.ts) < MACHINE_TTL) return _machineCache.data;
+
+  const [gpuData, clusterHealth, clusterSlots, deepblueOllama] = await Promise.all([
+    httpGet(`${config.machines.dashboardUrl}/api/gpu`, 3500),
+    httpGet(`${config.machines.bubbacuda.clusterHealthUrl}`, 2000),
+    httpGet(`${config.machines.bubbacuda.clusterDirectUrl}`, 3000),
+    httpGet(`${config.machines.deepblue.ollamaUrl}`, 3000),
+  ]);
+
+  // Parse bubbacuda GPUs from dashboard data
+  const bubbacudaSys = (gpuData && gpuData.bubbacuda_sys) ? gpuData.bubbacuda_sys : {};
+  const deepblueSys  = (gpuData && gpuData.deepblue_sys)  ? gpuData.deepblue_sys  : {};
+  const bubbacudaGpus = (gpuData && gpuData.gpus) ? gpuData.gpus.map(g => ({
+    index: g.index, name: g.name,
+    vram_used: g.memory_used, vram_total: g.memory_total,
+    util: g.utilization, temp: g.temperature,
+    power_draw: g.power_draw, power_limit: g.power_limit,
+  })) : [];
+
+  // Cluster model status
+  const clusterOk = clusterHealth && clusterHealth.status === 'ok';
+  let clusterSlotInfo = [];
+  if (clusterSlots && Array.isArray(clusterSlots)) {
+    clusterSlotInfo = clusterSlots.map(s => ({
+      id: s.id, state: s.state,
+      n_ctx: s.n_ctx, n_past: s.n_past,
+      model: s.model || 'llama33-70b-cluster',
+    }));
+  }
+
+  // deepblue info from Ollama
+  const deepblueModels = (deepblueOllama && deepblueOllama.models) ? deepblueOllama.models.map(m => ({
+    name: m.name, size: m.size, modified: m.modified_at,
+  })) : [];
+
+  // Use live deepblue GPU data from dashboard API if available
+  const deepblueGpusLive = (gpuData && gpuData.deepblue_gpus) ? gpuData.deepblue_gpus.map(g => ({
+    index: g.index, name: g.name,
+    vram_used: g.memory_used, vram_total: g.memory_total,
+    util: g.utilization, temp: g.temperature,
+    power_draw: g.power_draw, power_limit: g.power_limit,
+  })) : [];
+
+  const data = {
+    ts: now,
+    bubbacuda_sys: bubbacudaSys,
+    deepblue_sys: deepblueSys,
+    bubbacuda: {
+      ip: config.machines.bubbacuda.ip, role: 'GPU Server (2x RTX 3090)',
+      gpus: bubbacudaGpus,
+      services: {
+        cluster: { ok: clusterOk, url: config.machines.bubbacuda.clusterProxyUrl, model: 'llama33-70b-cluster' },
+        tts:     { ok: null },
+        imageGen:{ ok: null },
+      },
+      clusterSlots: clusterSlotInfo,
+      clusterModel: clusterOk ? 'Llama 3.3-70B Q4_K_L' : null,
+    },
+    deepblue: {
+      ip: config.machines.deepblue.ip, role: 'GPU Cluster Node (4x GPUs)',
+      ollamaOk: !!deepblueOllama,
+      rpcOk: clusterOk,
+      models: deepblueModels,
+      gpus: deepblueGpusLive,
+      gpuSpec: deepblueGpusLive.length ? null : [
+        { name: 'RTX 3080', vram_total: 10240 },
+        { name: 'RTX 3060 Ti', vram_total: 8192 },
+        { name: 'RTX 3080', vram_total: 10240 },
+        { name: 'RTX 3070', vram_total: 8192 },
+      ],
+    },
+    cluster: {
+      ok: clusterOk,
+      endpoint: config.machines.bubbacuda.clusterProxyUrl,
+      model: 'llama33-70b-cluster',
+      modelFull: 'Llama 3.3-70B-Instruct Q4_K_L',
+      totalVram: '~84GB across bubbacuda+deepblue',
+      slots: clusterSlotInfo,
+    },
+  };
+
+  _machineCache = { ts: now, data };
+  return data;
+}
+
+// Background refresh every 15s
+setInterval(async () => {
+  try { _machineCache.ts = 0; await fetchMachineData(); } catch(_) {}
+}, 15000);
+
 const fs = require('fs');
 const path = require('path');
 const { v4: uuidv4 } = require('uuid');
@@ -102,6 +239,24 @@ const AGENT_WS_URLS = config.agentWsUrls || {};
 
 // Legacy HTTP webhook fallback (loaded from config)
 const AGENT_HOOKS = config.agentHooks || {};
+// Embassy bridge: inject cross-network hook endpoints
+AGENT_HOOKS['pointman'] = AGENT_HOOKS['pointman'] || {};
+AGENT_HOOKS['pointman'].url = config.embassyBridge.pointmanUrl;
+AGENT_HOOKS['pointman'].token = 'embassy-bridge-2026';
+AGENT_HOOKS['brad'] = AGENT_HOOKS['brad'] || {};
+AGENT_HOOKS['brad'].url = config.embassyBridge.bradUrl;
+AGENT_HOOKS['brad'].token = 'embassy-bridge-2026';
+
+// Fleet agent HTTP hook URLs (for dispatch fallback)
+const FLEET_HOOKS = {
+  // Fleet hook URLs/tokens loaded from config/config.json (gitignored)
+  ...config.fleetHooks,
+};
+for (const [name, hook] of Object.entries(FLEET_HOOKS)) {
+  if (!AGENT_HOOKS[name]) AGENT_HOOKS[name] = {};
+  AGENT_HOOKS[name].url   = AGENT_HOOKS[name].url   || hook.url;
+  AGENT_HOOKS[name].token = AGENT_HOOKS[name].token || hook.token;
+}
 
 // --- Context Router: Tier-based dispatch ---
 const CONTEXT_ROUTER_URLS = [process.env.CONTEXT_ROUTER_URL || 'http://127.0.0.1:8852/completion', process.env.CONTEXT_ROUTER_FALLBACK_URL].filter(Boolean);
@@ -1077,7 +1232,7 @@ async function sendViaMesh(agentName, conversationId, messageText, sender, media
   const payload = {
     body: messageText,
     conversationId: conversationId,
-    sender: sender || "Richard",
+    sender: "Richard",
   };
   if (media && media.length > 0) {
     payload.media = media;
@@ -1360,9 +1515,14 @@ async function postToAgent(agentName, conversationId, messageText, history, prev
   }
 
   // ── Priority 1: Encrypted mesh dispatch (pulse/2.0, E2E) ──
-  const meshSent = await sendViaMesh(agentName, conversationId, fullBody, 'Richard', media);
+  // Only trust mesh if the agent's WS is actually connected — mesh API lies about delivery when WS is down
+  const wsAlive = agentWsState[agentName] && agentWsState[agentName].connected;
+  const meshSent = wsAlive ? await sendViaMesh(agentName, conversationId, fullBody, 'Richard', media) : false;
   if (meshSent) {
     return true;
+  }
+  if (!wsAlive) {
+    console.log();
   }
 
   // ── Priority 2: Legacy star WS (pulse/1.0, unencrypted) ──
@@ -1385,7 +1545,7 @@ async function postToAgent(agentName, conversationId, messageText, history, prev
     message: fullBody,
     sessionKey: `hook:${PEER_ID}:${conversationId}`,
     conversationId: conversationId,
-    sender: sender || "Richard",
+    sender: "Richard",
   };
 
   try {
@@ -2001,6 +2161,134 @@ async function handleRequest(req, res) {
       return;
     }
 
+
+    // POST /api/fleet/model — switch model for one or all agents persistently
+    if (pathname === '/api/fleet/model' && method === 'POST') {
+      let body;
+      try { body = await jsonBody(req); } catch(_) { err(res, 'Invalid JSON'); return; }
+      const { agentId, modelId } = body || {};
+      if (!modelId) { err(res, 'modelId required'); return; }
+
+      const AGENT_HOOKS = { ...config.fleetModelHooks };
+
+      const MODEL_MAP = {
+        sonnet: 'anthropic-proxy/claude-sonnet-4-6',
+        opus:   'anthropic-proxy/claude-opus-4-6',
+        local:  'local/llama33-70b',
+        cluster: 'cluster/llama33-70b-cluster',
+        codex:  'openai-codex/gpt-5.4-codex',
+      };
+      const fullModel = MODEL_MAP[modelId] || modelId;
+
+      const targets = agentId ? [agentId] : Object.keys(AGENT_HOOKS);
+      const results = {};
+      await Promise.all(targets.map(async (id) => {
+        const hook = AGENT_HOOKS[id];
+        if (!hook) { results[id] = 'unknown agent'; return; }
+        try {
+          const r = await fetch(hook.url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + hook.token },
+            body: JSON.stringify({
+              body: '/model ' + modelId,
+              message: '/model ' + modelId,
+              sender: 'Richard',
+              sender_type: 'human',
+            }),
+            signal: AbortSignal.timeout(6000),
+          });
+          const data = await r.json().catch(() => ({}));
+          results[id] = data.ok ? 'ok' : ('error: ' + JSON.stringify(data));
+        } catch(e) {
+          results[id] = 'failed: ' + e.message;
+        }
+      }));
+      // Persist state so UI stays in sync
+      if (agentId) {
+        _modelState.models[agentId] = modelId;
+      } else {
+        ALL_AGENTS.forEach(function(a) { _modelState.models[a] = modelId; });
+      }
+      _modelState.ts = Date.now();
+      _modelState.source = 'ui-switch';
+      saveModelState(_modelState);
+      json(res, { ok: true, model: fullModel, results, persisted: _modelState.models });
+      return;
+    }
+
+    // GET/POST /api/fleet/model-state — persistent tier-switch state
+    if (pathname === '/api/fleet/model-state') {
+      if (method === 'POST') {
+        let body;
+        try { body = await jsonBody(req); } catch(_) { err(res, 'Invalid JSON'); return; }
+        const { tier, model, ts } = body || {};
+        if (!tier || !model) { err(res, 'tier and model required'); return; }
+        const aliasMap = {
+          'anthropic-proxy/claude-sonnet-4-6': 'sonnet',
+          'anthropic-proxy/claude-opus-4-6':   'opus',
+          'local/llama33-70b':                 'local',
+        'cluster/llama33-70b-cluster':       'cluster',
+          'local/qwen3-32b':                   'local',
+          'openai-codex/gpt-5.4-codex':        'codex',
+        };
+        const alias = aliasMap[model] || tier;
+        _modelState = { models: Object.fromEntries(ALL_AGENTS.map(a => [a, alias])), ts: ts || Date.now(), source: 'tier-switch' };
+        saveModelState(_modelState);
+        json(res, { ok: true, tier, alias, models: _modelState.models });
+        return;
+      }
+      if (method === 'GET') {
+        json(res, { ok: true, models: _modelState.models, ts: _modelState.ts, source: _modelState.source });
+        return;
+      }
+    }
+
+    // POST /api/agent/model — update a single agent's model in state
+    if (pathname === '/api/agent/model' && method === 'POST') {
+      if (!checkIngestAuth(req)) { err(res, 'Unauthorized', 401); return; }
+      let body;
+      try { body = await jsonBody(req); } catch(_) { err(res, 'Invalid JSON'); return; }
+      const { agent, model } = body || {};
+      if (!agent || !model) { err(res, 'agent and model required'); return; }
+      const aliasMap = {
+        'anthropic-proxy/claude-sonnet-4-6': 'sonnet',
+        'anthropic-proxy/claude-sonnet-4-5': 'sonnet45',
+        'anthropic-proxy/claude-opus-4-6':   'opus',
+        'anthropic-proxy/claude-opus-4-5':   'opus45',
+        'local/llama33-70b':                 'local',
+        'cluster/llama33-70b-cluster':       'cluster',
+        'local/qwen3-32b':                   'local',
+        'openai-codex/gpt-5.4-codex':        'codex',
+      };
+      const alias = aliasMap[model] || model;
+      if (!_modelState.models) _modelState.models = {};
+      _modelState.models[agent] = alias;
+      _modelState.ts = Date.now();
+      _modelState.source = 'agent-push';
+      saveModelState(_modelState);
+      broadcast('model_update', { agent, model: alias, ts: _modelState.ts });
+      console.log('[ModelSync] ' + agent + ' -> ' + alias + ' (pushed by agent)');
+      json(res, { ok: true, agent, model: alias });
+      return;
+    }
+
+    // GET /api/agents/models — current model for each agent (for UI sync)
+    if (pathname === '/api/agents/models' && method === 'GET') {
+      const AGENT_HOOKS = { ...config.fleetModelHooks };
+      const MODEL_ALIAS_MAP = {
+        'anthropic-proxy/claude-sonnet-4-6': 'sonnet',
+        'anthropic-proxy/claude-opus-4-6':   'opus',
+        'local/llama33-70b':                 'local',
+        'cluster/llama33-70b-cluster':       'cluster',
+        'local/qwen3-32b':                   'local',
+        'openai-codex/gpt-5.4-codex':        'codex',
+      };
+      // Return stored fleet state — agents push updates via /api/agent/model
+      // No more broken gateway polling
+      json(res, { ok: true, models: _modelState.models || {}, ts: _modelState.ts || 0, source: _modelState.source || "state-file" });
+      return;
+    }
+
     // POST /api/messages
     if (pathname === '/api/messages' && method === 'POST') {
       let body;
@@ -2180,6 +2468,30 @@ async function handleRequest(req, res) {
       }
       
       storeMessage(msg);
+
+      // ── Embassy Bridge: forward dispatch messages to compound ──────────────
+      if (msg.conversation_id === 'embassy-group' && normalizedBody && normalizedBody.trim()) {
+        setImmediate(async () => {
+          try {
+            const r = await fetch(config.embassyBridge.pointmanUrl, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'x-bridge-token': 'embassy-bridge-2026',
+              },
+              body: JSON.stringify({
+                sender: msg.sender || 'Richard',
+                sender_type: msg.sender_type || 'human',
+                text: normalizedBody,
+              }),
+              signal: AbortSignal.timeout(10000),
+            });
+            console.log('[Embassy:Dispatch] Forwarded to compound (' + (msg.sender || 'Richard') + '): ' + r.status);
+          } catch (e) {
+            console.warn('[Embassy:Dispatch] Forward failed:', e.message);
+          }
+        });
+      }
 
       
 // ─── Response watchdog (avoid silent failures) ─────────────────────────────
@@ -2763,6 +3075,61 @@ function trackAgentResponse(conversationId, agentName, sinceTimestamp, timeoutMs
       // Stop typing indicator for this agent
       broadcast('typing_stop', { agentName: sender, conversationId: convId });
       json(res, { ok: true, id: msg.id }, 201);
+
+      // ── Embassy Bridge: bidirectional group chat mirror ──────────────────────
+      // ALL messages in embassy-group get:
+      //   1. Forwarded to thecompound (so Brad/PointMan see everything)
+      //   2. If from compound side (brad/pointman), dispatched to LtDan for a response
+      const EMBASSY_CONV = 'embassy-group';
+      const EMBASSY_BRIDGE_URL = config.embassyBridge.pointmanUrl;
+      const EMBASSY_BRIDGE_TOKEN = 'embassy-bridge-2026';
+      const COMPOUND_SENDERS = new Set(['brad', 'pointman', 'embassy']);
+      const isEmbassyMsg = convId === EMBASSY_CONV && msgBody && msgBody.trim();
+      const senderLower = (sender || '').toLowerCase();
+
+      if (isEmbassyMsg) {
+        // Forward ALL messages to thecompound (so compound side sees everything)
+        // Skip if the message originated FROM compound (they already have it)
+        if (!COMPOUND_SENDERS.has(senderLower)) {
+          setImmediate(async () => {
+            try {
+              const r = await fetch(EMBASSY_BRIDGE_URL, {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'x-bridge-token': EMBASSY_BRIDGE_TOKEN,
+                },
+                body: JSON.stringify({
+                  sender: sender,
+                  sender_type: msg.sender_type || 'agent',
+                  text: msgBody,
+                }),
+                signal: AbortSignal.timeout(10000),
+              });
+              console.log('[Embassy] Forwarded to compound (' + sender + '): ' + r.status);
+            } catch (e) {
+              console.warn('[Embassy] Forward to compound failed:', e.message);
+            }
+          });
+        }
+
+        // Dispatch to LtDan if message came from compound side
+        if (COMPOUND_SENDERS.has(senderLower)) {
+          setImmediate(async () => {
+            try {
+              const histRows = db.prepare('SELECT sender, sender_type, body FROM messages WHERE conversation_id = ? ORDER BY timestamp ASC').all(EMBASSY_CONV);
+              const hist = histRows.map(r => ({ sender: r.sender, body: r.body }));
+              const dispatchText = '[Embassy Group Chat] ' + sender + ' says: ' + msgBody;
+              broadcast('typing_start', { agentName: 'ltdan', conversationId: EMBASSY_CONV });
+              await postToAgent('ltdan', EMBASSY_CONV, dispatchText, hist, null, null, ['ltdan']);
+              console.log('[Embassy] Dispatched to LtDan from ' + sender);
+            } catch (e) {
+              console.warn('[Embassy] LtDan dispatch failed:', e.message);
+            }
+          });
+        }
+      }
+
       return;
     }
 
@@ -2974,6 +3341,18 @@ function trackAgentResponse(conversationId, agentName, sinceTimestamp, timeoutMs
       };
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(response, null, 2));
+      return;
+    }
+
+
+    // GET /api/machines — GPU + cluster resource data
+    if (pathname === '/api/machines' && method === 'GET') {
+      try {
+        const data = await fetchMachineData();
+        json(res, { ok: true, ...data });
+      } catch(e) {
+        json(res, { ok: false, error: e.message }, 500);
+      }
       return;
     }
 

@@ -11,7 +11,7 @@
                     <key>kind</key>
                     <string>software-package</string>
                     <key>url</key>
-                    <string>SERVER_URL/ios/PulseNet.ipa</string>
+                    <string>PULSENET_IPA_URL_PLACEHOLDER</string>
                 </dict>
             </array>
             <key>metadata</key>
@@ -19,7 +19,7 @@
                 <key>bundle-identifier</key>
                 <string>com.pulsenet.ios</string>
                 <key>bundle-version</key>
-                <string>1.0</string>
+                <string>20260309.2327</string>
                 <key>kind</key>
                 <string>software</string>
                 <key>title</key>

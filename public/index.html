@@ -14,7 +14,7 @@
   <meta name="theme-color" content="#5b7fff" />
   <link rel="apple-touch-icon" href="/icon-192.png" />
 
-  <link rel="stylesheet" href="/style.v2.css?v=1772603100" />
+  <link rel="stylesheet" href="/style.v2.css?v=1773245493" />
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/atom-one-dark.min.css">
   <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
@@ -30,6 +30,7 @@
       </div>
       <button id="new-chat-btn">+ New Chat</button>
       <button id="burn-monitor-btn">🔥 Burn Monitor</button>
+      <button id="machines-btn">🖥️ Machines</button>
 
       <!-- Filter Bar -->
       <div id="filter-bar">
@@ -87,6 +88,16 @@
         </div>
         <div id="burn-monitor-content" style="padding:14px;"></div>
       </div>
+      
+      <!-- Machines view -->
+      <div id="machines-view" class="hidden">
+        <div id="new-chat-header">
+          <button class="mobile-menu-float" onclick="openSidebar()" aria-label="Open menu">☰</button>
+          <h2>🖥️ Machine Resources</h2>
+        </div>
+        <div id="machines-content" style="padding:14px;"></div>
+      </div>
+
       <!-- Chat view -->
       <div id="chat-view" class="hidden">
         <div id="chat-header" style="position:relative">
@@ -127,7 +138,8 @@
       </div>
     </main>
   </div>
-  <script src="/app.v2.js?v=1772686800"></script>
+  <script src="/app.v2.js?v=1773245493"></script>
+  <script src="/model-picker.js?v=1773244952"></script>
 
   <!-- Image Lightbox -->
   <div id="lightbox" style="display:none; position:fixed; top:0; left:0; right:0; bottom:0; background:rgba(0,0,0,0.92); z-index:10000; justify-content:center; align-items:center; flex-direction:column;">
@@ -136,5 +148,6 @@
     <div id="lightbox-caption" style="color:rgba(255,255,255,0.7); margin-top:12px; font-size:14px; text-align:center; padding:0 16px;"></div>
   </div>
 
+  <script src="/dispatch-tracker.js?v=1773244952"></script>
 </body>
 </html>

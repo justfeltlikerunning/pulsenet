@@ -218,6 +218,7 @@ function showView(viewName) {
   dom.newChatView.classList.add('hidden');
   dom.chatView.classList.add('hidden');
   if (dom.burnView) dom.burnView.classList.add('hidden');
+  var _mv = document.getElementById('machines-view'); if (_mv) _mv.classList.add('hidden');
   if (viewName === 'empty') dom.emptyState.classList.remove('hidden');
   else if (viewName === 'new-chat') dom.newChatView.classList.remove('hidden');
   else if (viewName === 'chat') dom.chatView.classList.remove('hidden');
@@ -957,6 +958,7 @@ function scrollToBottom() {
 dom.newChatBtn.addEventListener('click', showNewChat);
 dom.emptyNewChatBtn.addEventListener('click', showNewChat);
 if (dom.burnMonitorBtn) dom.burnMonitorBtn.addEventListener('click', showBurnMonitor);
+var _machinesBtn = document.getElementById('machines-btn'); if (_machinesBtn) _machinesBtn.addEventListener('click', showMachines);
 
 function showNewChat() {
   currentConvId = null;
@@ -3304,3 +3306,221 @@ function showUndoToast(msgId, convId, windowMs) {
     toast.remove();
   });
 }
+
+// ── Machines Tab ─────────────────────────────────────────────────────────────
+var _machinesInterval = null;
+
+function showMachines() {
+  showView('__none__');  // hides all known views incl machines-view
+  var v = document.getElementById('machines-view');
+  if (v) v.classList.remove('hidden');
+  loadMachines();
+  if (_machinesInterval) clearInterval(_machinesInterval);
+  _machinesInterval = setInterval(loadMachines, 15000);
+}
+
+function _mpct(used, total) {
+  if (!total) return 0;
+  return Math.min(100, Math.round((used / total) * 100));
+}
+
+function _mpill(ok, labelOk, labelFail) {
+  labelOk   = labelOk   || 'Online';
+  labelFail = labelFail || 'Offline';
+  if (ok === null || ok === undefined) return '<span class="machine-pill pill-idle">Unknown</span>';
+  return ok
+    ? '<span class="machine-pill pill-ok">\u2713 ' + labelOk + '</span>'
+    : '<span class="machine-pill pill-dead">\u2717 ' + labelFail + '</span>';
+}
+
+function _mGpuRow(g) {
+  var vPct = _mpct(g.vram_used, g.vram_total);
+  var uPct = g.util || 0;
+  var vUsedGB = (g.vram_used / 1024).toFixed(1);
+  var vTotGB  = (g.vram_total / 1024).toFixed(0);
+  var html = '<div class="gpu-row">';
+  html += '<div class="gpu-row-label">';
+  html += '<strong>' + (g.name || ('GPU ' + g.index)) + '</strong>';
+  html += '<span>' + vUsedGB + '/' + vTotGB + ' GB';
+  if (g.util !== undefined) html += ' \u00b7 ' + uPct + '% util';
+  if (g.temp) html += ' \u00b7 ' + g.temp + '\u00b0C';
+  html += '</span></div>';
+  html += '<div class="bar-track"><div class="bar-fill-vram" style="width:' + vPct + '%"></div></div>';
+  if (uPct > 0) html += '<div class="bar-track"><div class="bar-fill-util" style="width:' + uPct + '%"></div></div>';
+  html += '</div>';
+  return html;
+}
+
+function _renderMachines(d) {
+  var bb  = d.bubbacuda || {};
+  var db  = d.deepblue  || {};
+  var cl  = d.cluster   || {};
+  var bbs = d.bubbacuda_sys || bb.sys || {};
+  var dbs = d.deepblue_sys  || db.sys || {};
+
+  function pct(used, total) {
+    if (!total) return 0;
+    return Math.min(100, Math.round(used * 100 / total));
+  }
+  function fmtGB(bytes) {
+    return (bytes / 1073741824).toFixed(1);
+  }
+  function bar(usedPct, color) {
+    return '<div class="res-bar-track"><div class="res-bar-fill" style="width:' + usedPct + '%;background:' + color + '"></div></div>';
+  }
+  function resRow(label, usedStr, totalStr, usedPct, color) {
+    return '<div class="res-row">'
+      + '<span class="res-label">' + label + '</span>'
+      + '<span class="res-val">' + usedStr + ' / ' + totalStr + '</span>'
+      + bar(usedPct, color)
+      + '<span class="res-pct">' + usedPct + '%</span>'
+      + '</div>';
+  }
+
+  function sysSection(s) {
+    if (!s || !s.cpu_cores) return '<div style="font-size:0.75em;color:var(--text-muted)">System info unavailable</div>';
+    var cpuPct  = s.cpu_pct || 0;
+    var ramUsed = s.mem_used  || 0;
+    var ramTot  = s.mem_total || 0;
+    var ramPct  = pct(ramUsed, ramTot);
+    var dk      = s.disk || {};
+    var diskUsed= dk.used  || 0;
+    var diskTot = dk.total || 0;
+    var diskPct = pct(diskUsed, diskTot);
+    var diskColor = diskPct > 85 ? '#f87171' : diskPct > 70 ? '#facc15' : '#4ade80';
+    var cpuColor  = cpuPct  > 85 ? '#f87171' : cpuPct  > 60 ? '#facc15' : '#38bdf8';
+    var ramColor  = ramPct  > 85 ? '#f87171' : ramPct  > 70 ? '#facc15' : '#a78bfa';
+    var loadStr   = (s.load1||0) + ' / ' + (s.load5||0) + ' / ' + (s.load15||0);
+    return '<div class="sys-section">'
+      + '<div class="cluster-section-title">System</div>'
+      + resRow('CPU', cpuPct + '%  (load ' + loadStr + ')', s.cpu_cores + ' cores', cpuPct, cpuColor)
+      + resRow('RAM', fmtGB(ramUsed) + ' GB', fmtGB(ramTot) + ' GB', ramPct, ramColor)
+      + resRow('Disk', fmtGB(diskUsed) + ' GB', fmtGB(diskTot) + ' GB', diskPct, diskColor)
+      + '<div class="res-uptime">\u23f1 ' + (s.uptime || '') + '</div>'
+      + '</div>';
+  }
+
+  function gpuSection(gpus, history) {
+    if (!gpus || !gpus.length) return '<div style="font-size:0.75em;color:var(--text-muted)">No GPU data</div>';
+    return '<div class="cluster-section-title" style="margin-top:12px">GPUs</div>'
+      + gpus.map(_mGpuRow).join('');
+  }
+
+  // ── Bubbacuda card ──
+  var bbGpus    = bb.gpus || [];
+  var bbVramTot = bbGpus.reduce(function(a,g){return a+g.vram_total;},0);
+  var bbVramUsd = bbGpus.reduce(function(a,g){return a+g.vram_used;},0);
+  var bbUtil    = bbGpus.length ? Math.round(bbGpus.reduce(function(a,g){return a+(g.util||0);},0)/bbGpus.length) : 0;
+
+  var slotsHtml = '';
+  if (cl.ok) {
+    if (cl.slots && cl.slots.length) {
+      slotsHtml = cl.slots.map(function(s) {
+        return '<div class="slot-row">'
+          + '<span class="slot-id">#' + s.id + '</span>'
+          + '<span class="' + (s.state===2?'slot-state-active':'slot-state-idle') + '">'
+          + (s.state===2 ? '\u26a1 Active' : '\ud83d\udca4 Idle') + '</span>'
+          + (s.n_past ? '<span class="slot-ctx">' + s.n_past.toLocaleString() + ' tok</span>' : '')
+          + '</div>';
+      }).join('');
+    } else {
+      slotsHtml = '<div style="font-size:0.75em;color:var(--text-muted)">All slots idle</div>';
+    }
+  }
+
+  var bbCard = '<div class="machine-card">'
+    + '<div class="machine-card-title">\ud83d\udda5\ufe0f bubbacuda '
+    + _mpill(true, db.bubbacuda?.ip || 'bubbacuda')
+    + (cl.ok ? '<span class="machine-pill pill-ok">Cluster \u2713</span>' : '<span class="machine-pill pill-dead">Cluster \u2717</span>')
+    + '</div>'
+    + '<div class="machine-card-sub">32 cores \u00b7 128 GB RAM \u00b7 2\u00d7 RTX 3090</div>'
+    + sysSection(bbs)
+    + gpuSection(bbGpus, null)
+    + '<div class="cluster-section">'
+    + '<div class="cluster-section-title" style="margin-top:12px">Active Model</div>'
+    + (cl.ok
+        ? '<div class="model-badge">'
+          + '<div class="model-badge-name">Llama 3.3-70B-Instruct</div>'
+          + '<div class="model-badge-detail">Q4_K_L \u00b7 65K ctx \u00b7 '
+          + (bbVramUsd/1024).toFixed(1) + '/' + (bbVramTot/1024).toFixed(0) + ' GB VRAM</div>'
+          + '</div>'
+          + '<div class="cluster-section-title" style="margin-top:8px">Inference Slots</div>'
+          + slotsHtml
+        : '<div style="font-size:0.8em;color:#f87171">Cluster offline</div>')
+    + '</div></div>';
+
+  // ── Deepblue card ──
+  var dbGpus    = db.gpus || [];
+  var dbHasLive = dbGpus.length > 0;
+  var dbSpec    = db.gpuSpec || [];
+  var dbVramTot = dbHasLive
+    ? dbGpus.reduce(function(a,g){return a+g.vram_total;},0)
+    : dbSpec.reduce(function(a,g){return a+g.vram_total;},0);
+  var dbVramUsd = dbHasLive ? dbGpus.reduce(function(a,g){return a+g.vram_used;},0) : 0;
+
+  var dbGpuHtml = dbHasLive
+    ? gpuSection(dbGpus, null)
+    : '<div class="deepblue-gpu-spec">'
+      + dbSpec.map(function(g) {
+          return '<div class="deepblue-gpu-chip">'
+            + '<div class="deepblue-gpu-chip-name">' + g.name + '</div>'
+            + '<div class="deepblue-gpu-chip-vram">' + (g.vram_total/1024).toFixed(0) + ' GB</div></div>';
+        }).join('')
+      + '</div>';
+
+  var dbModels = (db.models||[]).length
+    ? db.models.map(function(m) {
+        return '<div style="font-size:0.75em;padding:3px 0;border-bottom:1px solid rgba(255,255,255,0.06)">'
+          + '\ud83d\udce6 ' + m.name + (m.size ? ' \u00b7 ' + (m.size/1e9).toFixed(1) + 'GB' : '') + '</div>';
+      }).join('')
+    : '<div style="font-size:0.75em;color:var(--text-muted)">No models loaded</div>';
+
+  var dbCard = '<div class="machine-card">'
+    + '<div class="machine-card-title">\u26a1 deepblue '
+    + _mpill(db.ollamaOk, db.deepblue?.ip || 'deepblue') + _mpill(db.rpcOk, 'RPC Active', 'RPC Down')
+    + '</div>'
+    + '<div class="machine-card-sub">4 cores \u00b7 16 GB RAM \u00b7 4\u00d7 GPUs (36.7 GB VRAM)</div>'
+    + sysSection(dbs)
+    + dbGpuHtml
+    + '<div class="cluster-section">'
+    + '<div class="cluster-section-title" style="margin-top:12px">Ollama Models</div>'
+    + dbModels
+    + '</div></div>';
+
+  // ── Cluster summary ──
+  var totalVram = bbVramTot + dbVramTot;
+  var allUsed   = bbVramUsd + dbVramUsd;
+  var clCard = '<div class="machine-card" style="grid-column:1/-1">'
+    + '<div class="machine-card-title">\ud83c\udf10 GPU Cluster ' + _mpill(cl.ok, 'Online', 'Offline') + '</div>'
+    + '<div class="machine-card-sub">bubbacuda + deepblue \u00b7 '
+    + (totalVram/1024).toFixed(0) + ' GB total VRAM \u00b7 ' + (cl.endpoint || '\u2014') + '</div>'
+    + '<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-top:10px">'
+    + '<div style="text-align:center"><div style="font-size:1.4em;font-weight:800;color:#38bdf8">' + (allUsed/1024).toFixed(1) + ' GB</div><div style="font-size:0.72em;color:var(--text-muted)">VRAM In Use</div></div>'
+    + '<div style="text-align:center"><div style="font-size:1.4em;font-weight:800;color:#4ade80">' + bbUtil + '%</div><div style="font-size:0.72em;color:var(--text-muted)">bubbacuda Util</div></div>'
+    + '<div style="text-align:center"><div style="font-size:1.4em;font-weight:800;color:#a78bfa">' + (totalVram/1024).toFixed(0) + ' GB</div><div style="font-size:0.72em;color:var(--text-muted)">Total Cluster VRAM</div></div>'
+    + '<div style="text-align:center"><div style="font-size:1.4em;font-weight:800;color:#fb923c">' + ((bbs.cpu_pct||0)) + '%</div><div style="font-size:0.72em;color:var(--text-muted)">bubbacuda CPU</div></div>'
+    + '</div></div>';
+
+  var ts = d.ts ? new Date(d.ts).toLocaleTimeString() : '\u2014';
+  return '<div class="machines-refresh-row"><span>Updated ' + ts + '</span>'
+    + '<button class="machines-refresh-btn" onclick="loadMachines()">\u21bb Refresh</button></div>'
+    + '<div class="machines-grid">' + bbCard + dbCard + clCard + '</div>';
+}
+
+async function loadMachines() {
+  var el = document.getElementById('machines-content');
+  if (!el) return;
+  try {
+    var r = await fetch('/api/machines');
+    var d = await r.json();
+    if (d.ok) {
+      el.innerHTML = _renderMachines(d);
+    } else {
+      el.innerHTML = '<div style="color:#f87171;padding:20px">Error: ' + (d.error||'unknown') + '</div>';
+    }
+  } catch(e) {
+    el.innerHTML = '<div style="color:#f87171;padding:20px">Failed: ' + e.message + '</div>';
+  }
+}
+
+// machines-btn wired at init time above
